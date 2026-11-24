@@ -79,7 +79,7 @@ small{color:var(--mut);line-height:1.4;display:block;margin-top:3px}
 <canvas id="cv"></canvas>
 <div id="panel">
 <h1><span>Hex Grid Navigator</span><span id="liveBadge">Offline</span></h1>
-<div id="liveFeed">Not connected</div>
+<div id="liveFeed">Not connected (autosave active)</div>
 <div style="margin-bottom:8px"><button id="undoE" title="Ctrl+Z">↶ Undo edit</button><button id="redoE" title="Ctrl+Y / Ctrl+Shift+Z">↷ Redo edit</button></div>
 <fieldset><legend>1 · Create grid</legend>
 <div class="row"><label>Rows<input type="number" id="rows" value="728" min="2" max="3000"></label><label>Columns<input type="number" id="cols" value="728" min="2" max="3000"></label></div>
@@ -159,16 +159,15 @@ function restore(i){
 $('undoE').onclick=()=>restore(hidx-1);
 $('redoE').onclick=()=>restore(hidx+1);
 
-// ---------- P2P Live Networking (No Database Needed!)
+// ---------- P2P Live Networking + Local Autosave
 let peer = null;
 let connections = [];
 let isHost = false;
-let playerName = "Player";
-let activePass = "";
+let playerName = localStorage.getItem("hexnav_player") || "Player";
 let applyingRemote = false;
 
 function makePeerId(roomId, pass) {
-  return "hexnav-" + btoa(roomId + "::" + pass).replace(/=/g, "").replace(/[^a-zA-Z0-9]/g, "");
+  return "hexnav-" + btoa(unescape(encodeURIComponent(roomId + "::" + pass))).replace(/=/g, "").replace(/[^a-zA-Z0-9]/g, "");
 }
 
 function broadcast(msg) {
@@ -178,26 +177,38 @@ function broadcast(msg) {
   });
 }
 
-function payload(actionText) {
+function serializeState() {
   return {
-    type: "STATE_UPDATE",
-    actor: playerName,
-    action: actionText || "updated the map",
     rows, cols, cur, segs,
     pois: [...pois.values()],
     g1: G1.color, g3: G3.color, g4: G4.color, g2: G2
   };
 }
 
+function payload(actionText) {
+  return {
+    type: "STATE_UPDATE",
+    actor: playerName,
+    action: actionText || "updated the map",
+    ...serializeState()
+  };
+}
+
+function writeLocalSave() {
+  try {
+    localStorage.setItem('hexnav2', JSON.stringify(serializeState()));
+  } catch (e) {}
+}
+
 function save(skipHist, actionText) {
   if (!skipHist) commit();
-  try { localStorage.setItem('hexnav2', JSON.stringify({ rows, cols, cur, segs, pois: [...pois.values()], g1: G1.color, g3: G3.color, g4: G4.color, g2: G2 })); } catch (e) {}
+  writeLocalSave();
   broadcast(payload(actionText));
 }
 
-function applyRemoteData(d) {
+function applyStateData(d, isRemote) {
   if (!d || !d.rows || !d.cols) return;
-  applyingRemote = true;
+  if (isRemote) applyingRemote = true;
   try {
     if (d.rows !== rows || d.cols !== cols || !W) build(d.rows, d.cols, true);
     if (d.cur && inGrid(d.cur.q, d.cur.r)) cur = d.cur;
@@ -211,37 +222,60 @@ function applyRemoteData(d) {
     if (COL[d.g3]) G3.color = d.g3;
     if (COL[d.g4]) G4.color = d.g4;
     if (d.g2 && COL[d.g2.color]) Object.assign(G2, d.g2);
-    applyG2(); syncUI(); listPois();
-    
-    if (d.actor) $('liveFeed').textContent = `${d.actor} ${d.action || 'updated map'}`;
+    applyG2(); syncUI(); listPois(); initHist();
+    writeLocalSave();
+
+    if (isRemote && d.actor) $('liveFeed').textContent = `${d.actor} ${d.action || 'updated map'}`;
     dirty = true;
   } finally {
-    applyingRemote = false;
+    if (isRemote) applyingRemote = false;
   }
 }
 
+function loadSaved() {
+  try {
+    const raw = localStorage.getItem('hexnav2');
+    if (!raw) return false;
+    const d = JSON.parse(raw);
+    if (!d || !d.rows || !d.cols) return false;
+    applyStateData(d, false);
+    fitView();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function cleanupPeer() {
+  connections.forEach(c => { try { c.close(); } catch (e) {} });
+  connections = [];
+  if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+}
+
 function initHost(roomId, pass) {
+  cleanupPeer();
   const pId = makePeerId(roomId, pass);
   peer = new Peer(pId);
   isHost = true;
 
   peer.on('open', () => {
     $('gate').style.display = "none";
-    $('liveBadge').textContent = "● Host (Live)";
+    $('liveBadge').textContent = "● Host (0 joined)";
     $('liveBadge').classList.add('on');
-    $('liveFeed').textContent = `Room ready! Share Room ID & Password.`;
+    $('liveFeed').textContent = `Hosting "${roomId}" with saved map loaded.`;
+    writeLocalSave();
   });
 
   peer.on('connection', conn => {
     connections.push(conn);
     conn.on('open', () => {
-      conn.send(payload("sync initial state"));
+      conn.send(payload("synced saved map"));
       updateConnBadge();
     });
     conn.on('data', data => {
-      if (data.type === "STATE_UPDATE") {
-        applyRemoteData(data);
-        broadcast(data); // Re-broadcast to other clients
+      if (data && data.type === "STATE_UPDATE") {
+        applyStateData(data, true);
+        broadcast(data);
       }
     });
     conn.on('close', () => {
@@ -260,8 +294,10 @@ function initHost(roomId, pass) {
 }
 
 function initJoin(roomId, pass) {
+  cleanupPeer();
   const targetId = makePeerId(roomId, pass);
   peer = new Peer();
+  isHost = false;
 
   peer.on('open', () => {
     const conn = peer.connect(targetId);
@@ -275,13 +311,13 @@ function initJoin(roomId, pass) {
     });
 
     conn.on('data', data => {
-      if (data.type === "STATE_UPDATE") applyRemoteData(data);
+      if (data && data.type === "STATE_UPDATE") applyStateData(data, true);
     });
 
     conn.on('close', () => {
-      $('liveBadge').textContent = "Disconnected";
+      $('liveBadge').textContent = "Offline";
       $('liveBadge').classList.remove('on');
-      $('liveFeed').textContent = "Host disconnected.";
+      $('liveFeed').textContent = "Host went offline (local autosave kept).";
     });
 
     setTimeout(() => {
@@ -295,6 +331,7 @@ function initJoin(roomId, pass) {
 }
 
 function updateConnBadge() {
+  if (!isHost) return;
   const count = connections.filter(c => c.open).length;
   $('liveBadge').textContent = `● Host (${count} joined)`;
 }
@@ -302,11 +339,22 @@ function updateConnBadge() {
 // UI Handlers for Gate
 const urlParams = new URLSearchParams(location.search);
 if (urlParams.get("room")) $('roomInput').value = urlParams.get("room");
+else if (localStorage.getItem("hexnav_room")) $('roomInput').value = localStorage.getItem("hexnav_room");
+$('playerName').value = playerName;
+
+function saveSessionPrefs(r) {
+  try {
+    localStorage.setItem("hexnav_player", playerName);
+    localStorage.setItem("hexnav_room", r);
+  } catch (e) {}
+}
 
 $('hostBtn').onclick = () => {
   playerName = $('playerName').value.trim() || "Host";
   const r = $('roomInput').value.trim(), p = $('passInput').value;
   if (!r || !p) return $('gateErr').textContent = "Enter both Room ID and Password.";
+  $('gateErr').textContent = "";
+  saveSessionPrefs(r);
   initHost(r, p);
 };
 
@@ -314,6 +362,8 @@ $('joinBtn').onclick = () => {
   playerName = $('playerName').value.trim() || "Guest";
   const r = $('roomInput').value.trim(), p = $('passInput').value;
   if (!r || !p) return $('gateErr').textContent = "Enter both Room ID and Password.";
+  $('gateErr').textContent = "";
+  saveSessionPrefs(r);
   initJoin(r, p);
 };
 
@@ -325,7 +375,8 @@ function build(r,c,keep){
   const r0=Math.floor(rows/2),c0=Math.floor(cols/2);
   cur={q:c0,r:r0-((c0-(c0&1))>>1)};segs=[[cur]];
   $('info').textContent=` ${(rows*cols).toLocaleString()} hexes`;
-  applyG2();listPois();fitView();if(!keep){initHist();save(true, `built a ${rows}×${cols} grid`)}
+  applyG2();listPois();fitView();
+  if(!keep){initHist();save(true, `built a ${rows}×${cols} grid`)}
 }
 function fitView(){
   if(!W)return;const k=Math.min(innerWidth/W,innerHeight/H)*0.95;
@@ -386,7 +437,7 @@ addEventListener('keydown',e=>{
   if(m[k])move(m[k]);
   else if(k==='p'){e.preventDefault();markAt(cur)}
   else if(e.key==='Backspace'){e.preventDefault();undo()}
-  else if(k==='+'||k==='=')zoomAt(1.5,innerWidth/2,innerWidth/2);
+  else if(k==='+'||k==='=')zoomAt(1.5,innerWidth/2,innerHeight/2);
   else if(k==='-')zoomAt(1/1.5,innerWidth/2,innerHeight/2);
 });
 addEventListener('keyup',e=>held.delete(e.key));
@@ -633,7 +684,7 @@ function draw(){
   const steps=segs.reduce((a,sg)=>a+sg.length-1,0);
   $('status').textContent=`${cur?`cursor col ${toCol(cur.q,cur.r)}, row ${toRow(cur.q,cur.r)}`:''} · ${hover?`hover ${toCol(hover.q,hover.r)},${toRow(hover.q,hover.r)}`:'hover –'} · route ${steps} steps · POIs ${pois.size} · zoom ${k.toFixed(3)}×${hexPx<3.5?' (zoom in to see hexagons)':''}`;
 }
-build(728,728);
+if(!loadSaved())build(728,728);
 (function loop(){if(dirty){dirty=false;draw()}requestAnimationFrame(loop)})();
 </script>
 </body>
