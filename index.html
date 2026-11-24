@@ -72,7 +72,7 @@ body.isdm #dmPanel{display:block}
 #dmSw g{cursor:pointer}
 #dmSw .hx{fill:var(--bg);stroke:var(--acc);stroke-width:2.5}
 #dmSw g.on .hx{fill:var(--acc)}
-#dmSw text{fill:var(--text);font-weight:700;font-size:16px;text-anchor:middle;dominant-baseline:central;pointer-events:none}
+#dmSw text{fill:var(--text);font-weight:700;font-size:12px;text-anchor:middle;dominant-baseline:central;pointer-events:none}
 #dmSw g.on text{fill:#fff}
 #panel.ro .grip{opacity:.3;cursor:not-allowed}
 </style>
@@ -101,7 +101,7 @@ body.isdm #dmPanel{display:block}
 <div id="roMsg"></div>
 <fieldset id="rosterBox" style="display:none"><legend>Players &amp; roles (host only)</legend>
 <div id="roster"></div>
-<small>DM and Cartographer can edit routes and POIs. Party member can only read POI descriptions (click a POI on the map). No role = view only. Only you can change roles, undo and redo.</small></fieldset>
+<small>Cartographer edits the party map. DM can't edit the party map. Party member can only read POI descriptions (click a POI on the map). No role = view only. Only you can change roles, undo and redo.</small></fieldset>
 <fieldset id="dmPanel"><legend>0 · Dungeon Master Special</legend><div id="dmSw"></div></fieldset>
 <fieldset class="hostonly"><legend>1 · Create grid</legend>
 <div class="row"><label>Rows<input type="number" id="rows" value="728" min="2" max="3000"></label><label>Columns<input type="number" id="cols" value="728" min="2" max="3000"></label></div>
@@ -193,22 +193,57 @@ let isHost = false;
 let playerName = localStorage.getItem("hexnav_player") || "Player";
 let applyingRemote = false;
 
-// ---------- Dungeon Master Special (visible to the DM role only, not the host)
-let dmMode = null;   // null | 'ON' | 'OFF' (local to this DM's screen)
+// ---------- Dungeon Master Special (DM role only, not even the host)
+// The DM's private map lives ONLY in this browser. While it is active nothing is saved, committed or sent.
+let dmMode = null;               // null | 'DM map' | 'Party map'
+let dmActive = false;            // true while the private DM map is swapped into segs/pois/cur
+let partySaved = null;           // the shared (party) layer while the private one is swapped in
+const dmSecret = { segs: [], pois: new Map(), cur: null };
+const dmCol = { g3: 'blue', g4: 'yellow' };   // private route / POI colours
+const activeG3 = () => dmActive ? dmCol.g3 : G3.color;
+const activeG4 = () => dmActive ? dmCol.g4 : G4.color;
+const isDmUser = () => !isHost && myRole === "DM";
+function dmReset() { menuSeg = null; menuPoi = null; menuPrev = null; menuHex = null; tipKey = null; focusKey = null; }
+function dmEnter() {
+  if (dmActive) return;
+  partySaved = { segs, pois, cur };
+  const keep = p => p && inGrid(p.q, p.r);
+  let ss = dmSecret.segs.map(sg => sg.filter(keep)).filter(sg => sg.length);
+  [...dmSecret.pois].forEach(([k, p]) => { if (!keep(p)) dmSecret.pois.delete(k); });
+  let c = keep(dmSecret.cur) ? dmSecret.cur : (ss.length ? ss[ss.length - 1][ss[ss.length - 1].length - 1] : (keep(partySaved.cur) ? { q: partySaved.cur.q, r: partySaved.cur.r } : null));
+  if (!ss.length && c) ss = [[{ q: c.q, r: c.r }]];
+  segs = ss; pois = dmSecret.pois; cur = c;
+  dmActive = true; dmReset(); syncUI(); listPois(); dirty = true;
+}
+function dmLeave() {
+  if (!dmActive) return;
+  dmSecret.segs = segs; dmSecret.pois = pois; dmSecret.cur = cur;
+  segs = partySaved.segs; pois = partySaved.pois; cur = partySaved.cur;
+  partySaved = null; dmActive = false; dmReset(); syncUI(); listPois(); dirty = true;
+}
+function ghostLayer() {
+  if (!isDmUser()) return null;
+  if (dmActive) return { segs: partySaved.segs, pois: partySaved.pois, g3: G3.color, g4: G4.color };
+  if (dmMode === 'Party map') return { segs: dmSecret.segs, pois: dmSecret.pois, g3: dmCol.g3, g4: dmCol.g4 };
+  return null;
+}
 function setDmMode(m) {
+  if (dmActive && m !== 'DM map') dmLeave();
+  if (!dmActive && m === 'DM map') dmEnter();
   dmMode = m;
   document.querySelectorAll('#dmSw g').forEach(g => g.classList.toggle('on', g.dataset.m === m));
+  applyLock(); dirty = true;
 }
 (function () {
   const NS = 'http://www.w3.org/2000/svg', r = 30, svg = document.createElementNS(NS, 'svg');
-  svg.setAttribute('viewBox', '0 0 200 70');
-  [['ON', 50], ['OFF', 150]].forEach(([m, x]) => {
+  svg.setAttribute('viewBox', '0 0 240 70');
+  [['DM map', 62], ['Party map', 178]].forEach(([m, x]) => {
     const g = document.createElementNS(NS, 'g'); g.dataset.m = m;
     g.setAttribute('role', 'button'); g.setAttribute('aria-label', m);
     const pg = document.createElementNS(NS, 'polygon'); pg.setAttribute('class', 'hx');
-    pg.setAttribute('points', [...Array(6)].map((_, i) => { const a = Math.PI / 3 * i; return `${x + Math.cos(a) * r * 0.95 * 1.15},${35 + Math.sin(a) * r * 0.95}` }).join(' '));
+    pg.setAttribute('points', [...Array(6)].map((_, i) => { const a = Math.PI / 3 * i; return `${x + Math.cos(a) * r * 0.95 * 1.4},${35 + Math.sin(a) * r * 0.95}` }).join(' '));
     const t = document.createElementNS(NS, 'text'); t.setAttribute('x', x); t.setAttribute('y', 35); t.textContent = m;
-    g.append(pg, t); g.onclick = () => setDmMode(m); svg.appendChild(g);
+    g.append(pg, t); g.onclick = () => { if (isDmUser()) setDmMode(m); }; svg.appendChild(g);
   });
   $('dmSw').appendChild(svg);
 })();
@@ -217,8 +252,8 @@ function setDmMode(m) {
 const ROLES = ["DM", "Party member", "Cartographer"];
 let myRole = null;               // role given to this client by the host
 const players = new Map();       // host only: peerId -> {conn, name, role}
-const EDIT_ROLES = ["DM", "Cartographer"];   // Party member is view-only
-const canEdit = () => isHost || EDIT_ROLES.includes(myRole);
+// Party map: host + Cartographer edit it. DM edits only the private DM map. Party member is view-only.
+const canEdit = () => isHost || myRole === "Cartographer" || (myRole === "DM" && dmActive);
 function needHost() {
   if (isHost) return true;
   $('liveFeed').textContent = "Only the host can do that.";
@@ -228,7 +263,9 @@ function need() {
   if (canEdit()) return true;
   $('liveFeed').textContent = myRole === "Party member"
     ? "Party members can't edit. Click a POI on the map to read its description."
-    : "You can't edit yet — ask the host to give you a role.";
+    : myRole === "DM"
+      ? "Switch to DM map (Dungeon Master Special) to edit your own routes and POIs."
+      : "You can't edit yet — ask the host to give you a role.";
   return false;
 }
 const FREE_BTNS = new Set(['fit', 'zin', 'zout', 'undoE', 'redoE']);
@@ -240,13 +277,16 @@ function applyLock() {
   });
   $('panel').classList.toggle('ro', ro);
   document.body.classList.toggle('ishost', isHost);
-  const dm = !isHost && myRole === "DM";
+  const dm = isDmUser();
   document.body.classList.toggle('isdm', dm);
-  if (!dm) setDmMode(null);
+  if (!dm && dmMode !== null) setDmMode(null);
   $('roMsg').textContent = myRole === "Party member"
     ? "Party member: view only. Click a POI on the map to read its description (only you see it pop up)."
-    : "View only. Ask the host to give you a role before you can edit. DM and Cartographer can edit; Party member can only read POI descriptions.";
+    : myRole === "DM"
+      ? "Party map: view only. Pick DM map in the Dungeon Master Special panel to edit your own routes and POIs."
+      : "View only. Ask the host to give you a role before you can edit. Cartographers edit the party map; Party members can only read POI descriptions.";
   if (!ro) updAll();
+  if (dmActive) ['c1', 'c2'].forEach(id => $(id).disabled = true);
   updBtns();
 }
 function renderRoster() {
@@ -284,7 +324,7 @@ function makePeerId(roomId, pass) {
 }
 
 function broadcast(msg) {
-  if (applyingRemote) return;
+  if (applyingRemote || dmActive) return;
   connections.forEach(conn => {
     if (conn.open) conn.send(msg);
   });
@@ -309,18 +349,26 @@ function payload(actionText, noHist) {
 }
 
 function writeLocalSave() {
+  if (dmActive) return;
   try {
     localStorage.setItem('hexnav2', JSON.stringify(serializeState()));
   } catch (e) {}
 }
 
 function save(skipHist, actionText) {
+  if (dmActive) return;   // private DM map: never committed, stored or sent
   if (!skipHist) commit();
   writeLocalSave();
   broadcast(payload(actionText, skipHist));
 }
 
 function applyStateData(d, isRemote, histMode) {
+  const wasDm = dmActive;
+  if (wasDm) dmLeave();
+  try { applyStateDataCore(d, isRemote, histMode); }
+  finally { if (wasDm) dmEnter(); }
+}
+function applyStateDataCore(d, isRemote, histMode) {
   if (!d || !d.rows || !d.cols) return;
   if (isRemote) applyingRemote = true;
   try {
@@ -404,7 +452,7 @@ function initHost(roomId, pass) {
       }
       if (data.type === "STATE_UPDATE") {
         // Only the host decides who may edit: no role = edit rejected, sender is resynced.
-        if (!EDIT_ROLES.includes(pl.role)) { conn.send(payload("rejected an edit (your role can't edit)")); return; }
+        if (pl.role !== "Cartographer") { conn.send(payload("rejected an edit (your role can't edit the party map)")); return; }
         // Only the host may change grid size or the 2nd grid's on/ratio (colours are allowed).
         if (data.rows !== rows || data.cols !== cols || !data.g2 || data.g2.on !== G2.on || data.g2.ratio !== G2.ratio) {
           conn.send(payload("rejected a grid change (host only)")); return;
@@ -455,7 +503,7 @@ function initJoin(roomId, pass) {
       if (data.type === "ROLE") {
         myRole = ROLES.includes(data.role) ? data.role : null;
         applyLock(); updateBadge();
-        $('liveFeed').textContent = myRole ? `The host made you: ${myRole}${canEdit() ? " (can edit)" : " (view only)"}` : "The host has not given you a role (view only)";
+        $('liveFeed').textContent = myRole ? `The host made you: ${myRole}${myRole === "Cartographer" ? " (can edit)" : myRole === "DM" ? "" : " (view only)"}` : "The host has not given you a role (view only)";
         return;
       }
       if (data.type === "STATE_UPDATE") applyStateData(data, true);
@@ -738,11 +786,11 @@ function textOn(h){const n=parseInt(h.slice(1),16),l=.299*(n>>16)+.587*((n>>8)&2
 const G1={color:'green'},G3={color:'orange'},G2={on:false,ratio:3,rows:0,cols:0,ox:0,oy:0,color:'red',s:10};
 ['c1','c2','c3','c4'].forEach(id=>Object.keys(COL).forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n[0].toUpperCase()+n.slice(1);$(id).appendChild(o)}));
 function applyG2(){if(!W)return;const z=s*G2.ratio;G2.s=z;G2.cols=Math.max(1,Math.floor((W-0.5*z)/(1.5*z)));G2.rows=Math.max(1,Math.floor(H/(S3*z)-0.5));G2.ox=(W-(1.5*z*G2.cols+0.5*z))/2;G2.oy=(H-S3*z*(G2.rows+0.5))/2;$('g2info').textContent=`${G2.cols} × ${G2.rows} = ${(G2.cols*G2.rows).toLocaleString()} hexes`;dirty=true}
-function syncUI(){$('c1').value=G1.color;$('c2').value=G2.color;$('c3').value=G3.color;$('c4').value=G4.color;$('g2on').checked=G2.on;$('z2').value=G2.ratio}
-$('c1').onchange=()=>{if(!need())return;G1.color=$('c1').value;dirty=true;save(false,"changed grid 1 colour")};
-$('c2').onchange=()=>{if(!need())return;G2.color=$('c2').value;dirty=true;save(false,"changed grid 2 colour")};
-$('c3').onchange=()=>{if(!need())return;G3.color=$('c3').value;dirty=true;save(false,"changed route colour")};
-$('c4').onchange=()=>{if(!need())return;G4.color=$('c4').value;dirty=true;save(false,"changed POI colour")};
+function syncUI(){$('c1').value=G1.color;$('c2').value=G2.color;$('c3').value=activeG3();$('c4').value=activeG4();$('g2on').checked=G2.on;$('z2').value=G2.ratio}
+$('c1').onchange=()=>{if(!need()||dmActive)return;G1.color=$('c1').value;dirty=true;save(false,"changed grid 1 colour")};
+$('c2').onchange=()=>{if(!need()||dmActive)return;G2.color=$('c2').value;dirty=true;save(false,"changed grid 2 colour")};
+$('c3').onchange=()=>{if(!need())return;if(dmActive){dmCol.g3=$('c3').value;dirty=true;return}G3.color=$('c3').value;dirty=true;save(false,"changed route colour")};
+$('c4').onchange=()=>{if(!need())return;if(dmActive){dmCol.g4=$('c4').value;dirty=true;return}G4.color=$('c4').value;dirty=true;save(false,"changed POI colour")};
 $('g2on').onchange=()=>{if(!needHost())return;G2.on=$('g2on').checked;dirty=true;save(false,"toggled 2nd grid")};
 $('g2apply').onclick=()=>{if(!needHost())return;G2.ratio=Math.min(50,Math.max(0.3,+$('z2').value||3));G2.on=true;applyG2();syncUI();save(false,"updated 2nd grid")};
 syncUI();
@@ -759,6 +807,44 @@ function drawG2(x0,y0,x1,y1,k){
     for(let r=r0;r<=r1;r++)hexPath(cx,S3*z*(r+o)+S3*z/2,z);
   }
   ctx.stroke();ctx.restore();
+}
+function drawLayer(k,d,hexPx,g3,g4,ghost){
+  {const pc=COL[g4],tc=textOn(pc);
+  for(const p of pois.values()){
+    const[x,y]=ctr(p.q,p.r);
+    if(hexPx>=3.5){ctx.beginPath();hexPath(x,y,s*0.96);ctx.fillStyle=pc;ctx.fill()}
+    else{ctx.beginPath();ctx.arc(x,y,Math.max(s*0.6,4/k),0,7);ctx.fillStyle=pc;ctx.fill()}
+  }}
+  ctx.lineJoin='round';ctx.lineCap='round';
+  for(const sg of segs){
+    if(sg.length<2)continue;
+    ctx.beginPath();sg.forEach((p,i)=>{const[x,y]=ctr(p.q,p.r);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
+    ctx.strokeStyle=COL[g3];ctx.lineWidth=Math.max(s*0.25,2.5/k);ctx.stroke();
+  }
+  if(!ghost&&menuPrev&&segs.includes(menuPrev.seg)){const sg=menuPrev.seg;ctx.beginPath();
+    for(let i=menuPrev.idx;i<sg.length;i++){const[x,y]=ctr(sg[i].q,sg[i].r);i===menuPrev.idx?ctx.moveTo(x,y):ctx.lineTo(x,y)}
+    ctx.strokeStyle='#ff3030';ctx.lineWidth=Math.max(s*0.4,4/k);ctx.stroke()}
+  if(hexPx>=14){ctx.fillStyle=COL[g3];for(const sg of segs)for(const p of sg){const[x,y]=ctr(p.q,p.r);ctx.beginPath();ctx.arc(x,y,s*0.2,0,7);ctx.fill()}}
+  for(const sg of segs){const p=sg[0],[x,y]=ctr(p.q,p.r);ctx.beginPath();ctx.arc(x,y,Math.max(s*0.4,4/k),0,7);ctx.fillStyle='#3ddc84';ctx.fill()}
+  for(const sg of segs){
+    if(sg.length>=2){const a=sg[sg.length-2],b=sg[sg.length-1],[ax,ay]=ctr(a.q,a.r),[bx,by]=ctr(b.q,b.r),ang=Math.atan2(by-ay,bx-ax),L=Math.max(s*0.75,9/k),Wd=L*0.6;
+      ctx.save();ctx.translate(bx,by);ctx.rotate(ang);ctx.beginPath();ctx.moveTo(L*0.6,0);ctx.lineTo(-L*0.4,-Wd);ctx.lineTo(-L*0.4,Wd);ctx.closePath();
+      ctx.fillStyle=COL[g3];ctx.fill();ctx.lineWidth=1.5/k;ctx.strokeStyle=css('--bg');ctx.stroke();ctx.restore()}}
+  if(hexPx>=14){const pc=COL[g4],tc=textOn(pc);ctx.font=`bold ${s*0.62}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.lineJoin='round';ctx.lineWidth=s*0.16;ctx.strokeStyle=pc;
+    for(const p of pois.values()){const[x,y]=ctr(p.q,p.r);ctx.strokeText('P'+p.n,x,y);ctx.fillStyle=tc;ctx.fillText('P'+p.n,x,y)}}
+  {ctx.save();ctx.setTransform(d,0,0,d,0,0);ctx.font='12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif';ctx.textAlign='left';ctx.textBaseline='middle';
+    const bg=css('--panel'),fg=css('--text'),ln=css('--line');
+    for(const p of pois.values()){
+      if(!p.show)continue;
+      const[x,y]=ctr(p.q,p.r),sx=x*k+view.x,sy=(y-s)*k+view.y-6;
+      if(sx<-300||sy<-40||sx>innerWidth+300||sy>innerHeight+40)continue;
+      let txt=`P${p.n}: ${p.d||'(no description)'}`;if(txt.length>60)txt=txt.slice(0,59)+'…';
+      const w=ctx.measureText(txt).width+14,h=20,bx=sx-w/2,by=sy-h;
+      ctx.beginPath();ctx.roundRect?ctx.roundRect(bx,by,w,h,6):ctx.rect(bx,by,w,h);
+      ctx.fillStyle=bg;ctx.fill();ctx.strokeStyle=ln;ctx.lineWidth=1;ctx.stroke();
+      ctx.fillStyle=fg;ctx.fillText(txt,bx+7,by+h/2+.5);
+    }
+    ctx.restore()}
 }
 function draw(){
   const d=devicePixelRatio||1;
@@ -778,42 +864,9 @@ function draw(){
     ctx.strokeStyle=COL[G1.color];ctx.lineWidth=1/k;ctx.stroke();
   }else{ctx.strokeStyle=COL[G1.color];ctx.lineWidth=1/k;ctx.strokeRect(0,0,W,H)}
   drawG2(x0,y0,x1,y1,k);
-  {const pc=COL[G4.color],tc=textOn(pc);
-  for(const p of pois.values()){
-    const[x,y]=ctr(p.q,p.r);
-    if(hexPx>=3.5){ctx.beginPath();hexPath(x,y,s*0.96);ctx.fillStyle=pc;ctx.fill()}
-    else{ctx.beginPath();ctx.arc(x,y,Math.max(s*0.6,4/k),0,7);ctx.fillStyle=pc;ctx.fill()}
-  }}
-  ctx.lineJoin='round';ctx.lineCap='round';
-  for(const sg of segs){
-    if(sg.length<2)continue;
-    ctx.beginPath();sg.forEach((p,i)=>{const[x,y]=ctr(p.q,p.r);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
-    ctx.strokeStyle=COL[G3.color];ctx.lineWidth=Math.max(s*0.25,2.5/k);ctx.stroke();
-  }
-  if(menuPrev&&segs.includes(menuPrev.seg)){const sg=menuPrev.seg;ctx.beginPath();
-    for(let i=menuPrev.idx;i<sg.length;i++){const[x,y]=ctr(sg[i].q,sg[i].r);i===menuPrev.idx?ctx.moveTo(x,y):ctx.lineTo(x,y)}
-    ctx.strokeStyle='#ff3030';ctx.lineWidth=Math.max(s*0.4,4/k);ctx.stroke()}
-  if(hexPx>=14){ctx.fillStyle=COL[G3.color];for(const sg of segs)for(const p of sg){const[x,y]=ctr(p.q,p.r);ctx.beginPath();ctx.arc(x,y,s*0.2,0,7);ctx.fill()}}
-  for(const sg of segs){const p=sg[0],[x,y]=ctr(p.q,p.r);ctx.beginPath();ctx.arc(x,y,Math.max(s*0.4,4/k),0,7);ctx.fillStyle='#3ddc84';ctx.fill()}
-  for(const sg of segs){
-    if(sg.length>=2){const a=sg[sg.length-2],b=sg[sg.length-1],[ax,ay]=ctr(a.q,a.r),[bx,by]=ctr(b.q,b.r),ang=Math.atan2(by-ay,bx-ax),L=Math.max(s*0.75,9/k),Wd=L*0.6;
-      ctx.save();ctx.translate(bx,by);ctx.rotate(ang);ctx.beginPath();ctx.moveTo(L*0.6,0);ctx.lineTo(-L*0.4,-Wd);ctx.lineTo(-L*0.4,Wd);ctx.closePath();
-      ctx.fillStyle=COL[G3.color];ctx.fill();ctx.lineWidth=1.5/k;ctx.strokeStyle=css('--bg');ctx.stroke();ctx.restore()}}
-  if(hexPx>=14){const pc=COL[G4.color],tc=textOn(pc);ctx.font=`bold ${s*0.62}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.lineJoin='round';ctx.lineWidth=s*0.16;ctx.strokeStyle=pc;
-    for(const p of pois.values()){const[x,y]=ctr(p.q,p.r);ctx.strokeText('P'+p.n,x,y);ctx.fillStyle=tc;ctx.fillText('P'+p.n,x,y)}}
-  {ctx.save();ctx.setTransform(d,0,0,d,0,0);ctx.font='12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif';ctx.textAlign='left';ctx.textBaseline='middle';
-    const bg=css('--panel'),fg=css('--text'),ln=css('--line');
-    for(const p of pois.values()){
-      if(!p.show)continue;
-      const[x,y]=ctr(p.q,p.r),sx=x*k+view.x,sy=(y-s)*k+view.y-6;
-      if(sx<-300||sy<-40||sx>innerWidth+300||sy>innerHeight+40)continue;
-      let txt=`P${p.n}: ${p.d||'(no description)'}`;if(txt.length>60)txt=txt.slice(0,59)+'…';
-      const w=ctx.measureText(txt).width+14,h=20,bx=sx-w/2,by=sy-h;
-      ctx.beginPath();ctx.roundRect?ctx.roundRect(bx,by,w,h,6):ctx.rect(bx,by,w,h);
-      ctx.fillStyle=bg;ctx.fill();ctx.strokeStyle=ln;ctx.lineWidth=1;ctx.stroke();
-      ctx.fillStyle=fg;ctx.fillText(txt,bx+7,by+h/2+.5);
-    }
-    ctx.restore()}
+  {const gl=ghostLayer();
+  if(gl){const sg0=segs,po0=pois;segs=gl.segs;pois=gl.pois;ctx.globalAlpha=0.1;drawLayer(k,d,hexPx,gl.g3,gl.g4,true);ctx.globalAlpha=1;segs=sg0;pois=po0}
+  drawLayer(k,d,hexPx,activeG3(),activeG4(),false)}
   if(hover&&hexPx>=3.5){const[x,y]=ctr(hover.q,hover.r);ctx.beginPath();hexPath(x,y,s);ctx.fillStyle='rgba(62,166,255,.3)';ctx.fill()}
   if(cur){const[x,y]=ctr(cur.q,cur.r);ctx.beginPath();hexPath(x,y,Math.max(s,6/k));ctx.strokeStyle='#3ea6ff';ctx.lineWidth=Math.max(2/k,s*.12);ctx.stroke()}
   const tp=tipKey&&pois.get(tipKey),tipEl=$('tip');
